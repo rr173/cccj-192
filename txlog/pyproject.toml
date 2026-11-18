@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "txlog"
+version = "0.1.0"
+description = "Transactional, partitioned, segmented local disk log with read_committed/read_uncommitted fetch"
+requires-python = ">=3.9"
+
+[project.scripts]
+txlog = "txlog.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["txlog*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
