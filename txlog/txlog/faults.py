@@ -15,6 +15,9 @@ Every durable operation in txlog passes through named fault points, e.g.:
     retain.after_catalog    segments marked deleted + frontier advanced
     retain.after_delete     segment files unlinked
     fetch.after_snapshot    fetch snapshot taken (hook-only, for tests)
+    reader.poll.after_meta  poll progress committed, receipt being returned
+    reader.ack.after_meta   ack + safe cursor committed, receipt being
+                            returned (a lost receipt must retry idempotently)
 
 Configuration:
   * Environment variable TXLOG_FAULT="<point>" or "<point>:<n>" — when the

@@ -4,15 +4,22 @@
 Generates a concurrent transactional workload against a log directory:
 multiple producers run begin/append/commit/abort cycles (with occasional
 epoch bumps), non-transactional appends interleave, readers continuously
-fetch under both isolation levels, and a retainer advances the retention
-frontier.  Invariants are checked online and in a final verification pass
-after a fresh reopen (full recovery):
+fetch under both isolation levels, NAMED application readers poll and ack
+records (out of order, with handle reopens and replays mixed in), and a
+retainer advances the retention frontier.  Invariants are checked online
+and in a final verification pass after a fresh reopen (full recovery):
 
   * every acknowledged (partition, offset) maps to exactly one payload;
   * read_committed never delivers aborted or uncommitted records;
   * offsets in every partition are physically contiguous from the
     retention frontier to the high watermark (abort holes included);
-  * fetch always terminates and next_offset never goes backwards.
+  * fetch always terminates and next_offset never goes backwards;
+  * every named reader's safe cursor never crosses an unacked gap, never
+    passes the retention frontier, and retain is clamped by the slowest
+    reader; unacked records stay redeliverable after a reopen.
+
+All data is generated at runtime into --dir and the scale is bounded by
+the CLI flags; no large generated files are ever committed.
 
 Usage:
   python3 scripts/stress.py --dir /tmp/txlog-stress --ops 3000
@@ -143,6 +150,107 @@ def retainer(log, n_partitions, stop, stats):
         time.sleep(0.01)
 
 
+def reader_worker(log, rid, n_partitions, stop, tracker, stats):
+    """Named resumable reader: poll/ack with out-of-order completion,
+    periodic handle reopens (redelivery checks) and occasional replays."""
+    rng = random.Random()
+    handle = log.create_reader(rid, start=0)
+    pending = {p: set() for p in range(n_partitions)}
+    reopened = 0
+    while not stop.is_set():
+        p = rng.randrange(n_partitions)
+        try:
+            if rng.random() < 0.05:
+                # simulate a process restart: a brand-new handle resumes
+                # from the durable safe cursor and redelivers unacked work
+                handle.close()
+                handle = log.open_reader(rid)
+                reopened += 1
+            elif rng.random() < 0.05:
+                try:
+                    handle.replay(p, rng.randrange(0, 4))
+                except txlog.ReaderDataUnavailable:
+                    pass
+            page = handle.poll(p, max_records=rng.randint(1, 16),
+                               max_scan=rng.randint(8, 40))
+            stats["reader_polls"] += 1
+            for rec in page["records"]:
+                tracker.check_record(rec, "read_committed")
+                pending[p].add(rec["offset"])
+            # ack in random order, leaving ~10% deliberately unacked so
+            # gap-blocking and redelivery are exercised continuously
+            for off in list(pending[p]):
+                if rng.random() < 0.9:
+                    try:
+                        handle.ack(p, off)
+                        stats["reader_acks"] += 1
+                        pending[p].discard(off)
+                    except txlog.ReaderAckError as e:
+                        # abort holes / races are classified rejections
+                        stats["ack_rejected:" + e.reason] = (
+                            stats.get("ack_rejected:" + e.reason, 0) + 1)
+                        pending[p].discard(off)
+        except txlog.ReaderDataUnavailable as e:
+            # explicit recoverable-boundary contract: resume there
+            try:
+                handle.replay(p, e.retained_below)
+            except txlog.TxLogError:
+                pass
+        except txlog.TxLogError as e:
+            tracker.errors.append(f"reader {rid}: {e!r}")
+            return
+    handle.close()
+    stats["reader_reopens"] = stats.get("reader_reopens", 0) + reopened
+
+
+def verify_readers(dir_path, n_partitions, reader_ids):
+    """Post-recovery reader invariants: cursors coherent vs. retention,
+    and redelivery sweeps never read deleted data."""
+    errors = []
+    log = txlog.Log(dir_path)
+    try:
+        registry = log.list_readers()
+        for rid in reader_ids:
+            if rid not in registry:
+                continue
+            r = log.open_reader(rid)
+            for p in range(n_partitions):
+                st = r.status(p)["partitions"].get(p)
+                if st is None:
+                    continue
+                safe, read = st["safe_offset"], st["read_offset"]
+                if safe > read:
+                    errors.append(
+                        f"{rid} p{p}: safe {safe} > read {read}")
+                if any(g < safe for g in st["blocking_gaps"]):
+                    errors.append(
+                        f"{rid} p{p}: gap below safe cursor {st}")
+                retained = log.inspect(partition=p)["partitions"][p][
+                    "retained_below"]
+                if safe < retained:
+                    errors.append(
+                        f"{rid} p{p}: safe {safe} behind frontier "
+                        f"{retained} — retain crossed a reader hold")
+                # redelivery sweep from the safe cursor
+                off, seen = safe, []
+                for _ in range(100000):
+                    page = r.poll(p, offset=off, max_records=64,
+                                  max_scan=128)
+                    seen += [x["offset"] for x in page["records"]]
+                    if page["reason"] in ("log_end", "stable_frontier"):
+                        break
+                    off = page["next_offset"]
+                if seen != sorted(set(seen)):
+                    errors.append(
+                        f"{rid} p{p}: non-unique redelivery {len(seen)}")
+                if any(o < safe for o in seen):
+                    errors.append(
+                        f"{rid} p{p}: redelivery below safe cursor")
+    finally:
+        log.close()
+    return errors
+
+
 def verify(dir_path, n_partitions, tracker):
     """Fresh reopen (full recovery) + complete sweep verification."""
     log = txlog.Log(dir_path)
@@ -190,6 +298,8 @@ def main():
     ap.add_argument("--segment-bytes", type=int, default=64 * 1024)
     ap.add_argument("--dedup-window", type=int, default=64)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--named-readers", type=int, default=2,
+                    help="number of concurrent named resumable readers")
     ap.add_argument("--small", action="store_true",
                     help="tiny fixture: runs in a few seconds")
     args = ap.parse_args()
@@ -197,6 +307,7 @@ def main():
         args.ops = 150
         args.writers = 2
         args.readers = 2
+        args.named_readers = 2
         args.partitions = 2
         args.segment_bytes = 1024
         args.dedup_window = 16
@@ -205,7 +316,8 @@ def main():
     log = txlog.Log(args.dir, segment_bytes=args.segment_bytes,
                     dedup_window=args.dedup_window)
     tracker = Tracker()
-    stats = {"fetches": 0, "retains": 0}
+    stats = {"fetches": 0, "retains": 0, "reader_polls": 0,
+             "reader_acks": 0}
     n = {"v": 0}
     nmu = threading.Lock()
 
@@ -234,6 +346,13 @@ def main():
                           args=(log, args.partitions, stop, stats))
     rt.start()
     threads.append(rt)
+    reader_ids = [f"named-r{i}" for i in range(args.named_readers)]
+    for rid in reader_ids:
+        t = threading.Thread(
+            target=reader_worker,
+            args=(log, rid, args.partitions, stop, tracker, stats))
+        t.start()
+        threads.append(t)
 
     t0 = time.monotonic()
     for t in threads[:args.writers]:
@@ -245,17 +364,26 @@ def main():
     log.close()
 
     print(f"workload: {args.writers}x{args.ops} ops, {n['v']} records, "
-          f"{stats['fetches']} fetches, {stats['retains']} retains "
-          f"in {dt:.1f}s ({n['v'] / max(dt, 1e-9):.0f} rec/s)")
+          f"{stats['fetches']} fetches, {stats['retains']} retains, "
+          f"{stats['reader_polls']} reader polls, "
+          f"{stats['reader_acks']} reader acks in {dt:.1f}s "
+          f"({n['v'] / max(dt, 1e-9):.0f} rec/s)")
+    rejected = {k: v for k, v in stats.items()
+                if k.startswith("ack_rejected:")}
+    if rejected:
+        print("classified ack rejections:", rejected)
 
     verify(args.dir, args.partitions, tracker)
+    reader_errors = verify_readers(args.dir, args.partitions, reader_ids)
+    tracker.errors.extend(reader_errors)
 
     if tracker.errors:
         print(f"FAILED: {len(tracker.errors)} invariant violations")
         for e in tracker.errors[:20]:
             print("  -", e)
         return 1
-    print("OK: all invariants held (online + post-recovery verification)")
+    print("OK: all invariants held (online + post-recovery verification, "
+          "including named-reader cursors and retention holds)")
     return 0
 
 

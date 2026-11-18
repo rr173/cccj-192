@@ -80,6 +80,48 @@ CREATE TABLE IF NOT EXISTS segments (
     state       TEXT NOT NULL CHECK (state IN ('active','sealed','deleted')),
     PRIMARY KEY (partition, base_offset)
 );
+
+-- Named, resumable application readers.  Only metadata lives here: record
+-- payloads stay in the segment files.  A reader starts either at the current
+-- retention boundary of each partition (start_mode='boundary') or at one
+-- explicit offset (start_mode='offset'), recorded once at creation and
+-- never rewritten by recreate/conflict/poll/replay.
+CREATE TABLE IF NOT EXISTS readers (
+    reader_id   TEXT PRIMARY KEY,
+    start_mode  TEXT NOT NULL CHECK (start_mode IN ('boundary','offset')),
+    start_offset INTEGER,               -- set iff start_mode='offset'
+    created_at  REAL NOT NULL
+);
+
+-- Per-reader/per-partition progress:
+--   read_offset: every read_committed-visible record with offset below this
+--                has been delivered at least once by some poll() of this
+--                reader (durable; used to resume after a crash).
+--   safe_offset: contiguous-acknowledgement cursor.  All DELIVERED records
+--                in [start, safe_offset) have been acknowledged; abort holes
+--                are skipped.  It can never equal "highest acked offset":
+--                an unacked gap before it blocks advancement.  This is the
+--                value retention must not cross.
+CREATE TABLE IF NOT EXISTS reader_positions (
+    reader_id   TEXT NOT NULL,
+    partition   INTEGER NOT NULL,
+    read_offset INTEGER NOT NULL,
+    safe_offset INTEGER NOT NULL,
+    PRIMARY KEY (reader_id, partition)
+);
+
+-- The acknowledgement SET.  Rows below safe_offset are pruned when the
+-- contiguous cursor advances; what remains are the out-of-order acks above
+-- the gap (the blocking-gap evidence).  PRIMARY KEY makes a repeated ack
+-- idempotent; there is no "max offset" shortcut anywhere.
+CREATE TABLE IF NOT EXISTS reader_acks (
+    reader_id TEXT NOT NULL,
+    partition INTEGER NOT NULL,
+    offset    INTEGER NOT NULL,
+    PRIMARY KEY (reader_id, partition, offset)
+);
+CREATE INDEX IF NOT EXISTS idx_reader_acks
+    ON reader_acks(reader_id, partition, offset);
 """
 
 FORMAT_VERSION = "1"

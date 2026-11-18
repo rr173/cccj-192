@@ -35,8 +35,8 @@ from contextlib import contextmanager
 
 from . import db, storage
 from .errors import (ContentConflict, CorruptionError, ProducerFenced,
-                     SequenceGap, SequenceTooOld, TxLogError, TxnStateError,
-                     UnknownTransaction)
+                     ReaderConflict, SequenceGap, SequenceTooOld, TxLogError,
+                     TxnStateError, UnknownReader, UnknownTransaction)
 from .faults import FaultInjector
 
 DEFAULT_SEGMENT_BYTES = 64 * 1024 * 1024
@@ -639,6 +639,154 @@ class Log:
         epoch, _ = self._open_producer(producer_id)
         return Producer(self, producer_id, epoch)
 
+    # -- named readers --------------------------------------------------------
+
+    def create_reader(self, reader_id, start=None):
+        """Create (or explicitly reuse) a durable named reader.
+
+        ``start=None``  — the reader starts at each partition's current
+        retention boundary on first poll (a "tail" reader).
+        ``start=int``   — the reader starts at that still-readable offset.
+
+        Re-creating an existing reader_id is NEVER a silent reset:
+        * identical configuration -> the existing reader is returned with
+          ``reused=True``, all progress untouched (idempotent);
+        * different configuration -> ReaderConflict, progress untouched.
+        """
+        self._check_writable()
+        if not isinstance(reader_id, str) or not reader_id:
+            raise ValueError("reader_id must be a non-empty string")
+        if start is None:
+            mode, start_offset = "boundary", None
+        else:
+            start_offset = _as_offset(start)
+            mode = "offset"
+        with self._write_mu():
+            con = self._connect()
+            try:
+                with self._txn(con):
+                    row = con.execute(
+                        "SELECT * FROM readers WHERE reader_id=?",
+                        (reader_id,)).fetchone()
+                    reused = row is not None
+                    if row is None:
+                        con.execute(
+                            "INSERT INTO readers VALUES (?,?,?,?)",
+                            (reader_id, mode, start_offset, time.time()))
+                    elif (row["start_mode"] != mode
+                          or row["start_offset"] != start_offset):
+                        raise ReaderConflict(
+                            f"reader {reader_id!r} already exists with "
+                            f"start_mode={row['start_mode']!r} "
+                            f"start_offset={row['start_offset']}; requested "
+                            f"start_mode={mode!r} start_offset={start_offset}. "
+                            f"Existing progress was not modified")
+                from .reader import Reader
+                return Reader(self, reader_id, reused=reused)
+            finally:
+                con.close()
+
+    def open_reader(self, reader_id):
+        """Open a handle onto an existing durable reader."""
+        self._check_writable()
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT 1 FROM readers WHERE reader_id=?",
+                (reader_id,)).fetchone()
+            if row is None:
+                raise UnknownReader(f"unknown reader {reader_id!r}")
+        finally:
+            con.close()
+        from .reader import Reader
+        return Reader(self, reader_id, reused=True)
+
+    def list_readers(self):
+        """All durable readers with their per-partition progress."""
+        self._check_open()
+        con = self._connect()
+        try:
+            out = {}
+            for r in con.execute(
+                    "SELECT * FROM readers ORDER BY reader_id"):
+                out[r["reader_id"]] = {
+                    "start_mode": r["start_mode"],
+                    "start_offset": r["start_offset"],
+                    "partitions": {}}
+            for r in con.execute(
+                    "SELECT * FROM reader_positions ORDER BY reader_id, "
+                    "partition"):
+                gaps = [x["offset"] for x in con.execute(
+                    "SELECT offset FROM reader_acks WHERE reader_id=? AND "
+                    "partition=? AND offset>=? ORDER BY offset",
+                    (r["reader_id"], r["partition"], r["safe_offset"]))]
+                out[r["reader_id"]]["partitions"][r["partition"]] = {
+                    "read_offset": r["read_offset"],
+                    "safe_offset": r["safe_offset"],
+                    "blocking_gaps": gaps}
+            return out
+        finally:
+            con.close()
+
+    def delete_reader(self, reader_id, handle=None):
+        """Explicitly delete a reader and ALL of its progress.
+
+        Returns the reader's previous per-partition safe cursors together
+        with the retention frontier now in force: the caller can see exactly
+        which reader-imposed holds were released and which cleanup becomes
+        possible on the next ``retain``.  Nothing is deleted immediately —
+        the effect is recomputed by the next retain.
+        """
+        self._check_writable()
+        with self._write_mu():
+            con = self._connect()
+            try:
+                row = con.execute(
+                    "SELECT * FROM readers WHERE reader_id=?",
+                    (reader_id,)).fetchone()
+                if row is None:
+                    raise UnknownReader(f"unknown reader {reader_id!r}")
+                positions = {r["partition"]:
+                             {"read_offset": r["read_offset"],
+                              "safe_offset": r["safe_offset"]}
+                             for r in con.execute(
+                                 "SELECT * FROM reader_positions "
+                                 "WHERE reader_id=?", (reader_id,))}
+                retained = {r["partition"]: r["retained_below"] for r in
+                            con.execute("SELECT partition, retained_below "
+                                        "FROM partitions")}
+                with self._txn(con):
+                    con.execute("DELETE FROM reader_acks WHERE reader_id=?",
+                                (reader_id,))
+                    con.execute(
+                        "DELETE FROM reader_positions WHERE reader_id=?",
+                        (reader_id,))
+                    con.execute("DELETE FROM readers WHERE reader_id=?",
+                                (reader_id,))
+                if handle is not None and getattr(handle, "reader_id",
+                                                   None) == reader_id:
+                    handle._closed = True
+                    handle._poll_pos.clear()
+                return {"reader_id": reader_id,
+                        "start_mode": row["start_mode"],
+                        "start_offset": row["start_offset"],
+                        "former_positions": positions,
+                        "retained_below": retained,
+                        "retention_effect": (
+                            "reader hold released; run retain() on each "
+                            "partition to recompute the cleanable boundary")}
+            finally:
+                con.close()
+
+    @staticmethod
+    def _reader_floor(con, partition):
+        """Smallest live reader safe cursor on a partition; hw when no
+        reader tracks it.  Retention may never cross this value."""
+        row = con.execute(
+            "SELECT MIN(safe_offset) AS f FROM reader_positions "
+            "WHERE partition=?", (partition,)).fetchone()
+        return row["f"] if row and row["f"] is not None else None
+
     def _open_txn(self, con, producer_id):
         return con.execute(
             "SELECT * FROM transactions WHERE producer_id=? AND state='open'",
@@ -989,8 +1137,10 @@ class Log:
 
         The actually applied boundary is the minimum of the request and the
         hard constraints: the partition's stable frontier (pending
-        transactions keep their data) and the dedup retention floor (retry
-        identity is never lost while inside its window).  Only sealed
+        transactions keep their data), the dedup retention floor (retry
+        identity is never lost while inside its window) and every LIVE
+        reader's contiguous safe cursor on this partition (a slow reader
+        keeps the segments it has not finished processing).  Only sealed
         segments fully below the applied boundary are unlinked; the
         retention frontier itself is logical and exact.  Returns the
         evidence: applied boundary, deleted segments, binding constraint.
@@ -1010,13 +1160,23 @@ class Log:
                                 "requested": before_offset, "applied": 0,
                                 "retained_below": 0, "deleted_segments": [],
                                 "constrained_by": "empty", "lso": 0,
-                                "dedup_floor": 0, "high_watermark": 0}
+                                "dedup_floor": 0, "reader_floor": None,
+                                "reader_holds": [], "high_watermark": 0}
                     hw = prow["next_offset"]
                     retained = prow["retained_below"]
                     lso = self._lso(con, partition, hw)
                     floor = self._dedup_floor(con, partition, hw)
-                    applied = min(before_offset, lso, floor, hw)
+                    reader_floor = self._reader_floor(con, partition)
+                    candidates = [before_offset, lso, floor, hw]
+                    if reader_floor is not None:
+                        candidates.append(reader_floor)
+                    applied = min(candidates)
                     new_retained = max(retained, applied)
+                    reader_holds = [dict(r) for r in con.execute(
+                        "SELECT reader_id, safe_offset FROM reader_positions "
+                        "WHERE partition=? "
+                        "ORDER BY safe_offset, reader_id",
+                        (partition,))]
                     doomed = [dict(r) for r in con.execute(
                         "SELECT * FROM segments WHERE partition=? AND "
                         "state='sealed' AND max_offset < ? "
@@ -1044,13 +1204,16 @@ class Log:
                                         "path": s["path"]})
                     self._fault.maybe("retain.after_delete")
                     constrained = _constraint(before_offset, applied, lso,
-                                              floor, hw)
+                                              floor, hw, reader_floor)
                     return {"partition": partition,
                             "requested": before_offset, "applied": applied,
                             "retained_below": new_retained,
                             "deleted_segments": deleted,
                             "constrained_by": constrained, "lso": lso,
-                            "dedup_floor": floor, "high_watermark": hw}
+                            "dedup_floor": floor,
+                            "reader_floor": reader_floor,
+                            "reader_holds": reader_holds,
+                            "high_watermark": hw}
                 finally:
                     con.close()
 
@@ -1086,10 +1249,10 @@ class Log:
             con = self._connect()
             try:
                 out = {"config": {"format": FORMAT_VERSION,
-                                  "segment_bytes": self.segment_bytes,
-                                  "dedup_window": self.dedup_window},
+                              "segment_bytes": self.segment_bytes,
+                              "dedup_window": self.dedup_window},
                        "producers": {}, "transactions": [],
-                       "partitions": {},
+                       "partitions": {}, "readers": {},
                        "recovery_report": list(self.recovery_report)}
                 for r in con.execute(
                         "SELECT * FROM producers ORDER BY producer_id"):
@@ -1123,6 +1286,11 @@ class Log:
                                                       r["next_offset"]),
                         "dedup_floor": self._dedup_floor(con, p,
                                                        r["next_offset"]),
+                        "reader_floor": self._reader_floor(con, p),
+                        "reader_holds": [dict(s) for s in con.execute(
+                            "SELECT reader_id, safe_offset FROM "
+                            "reader_positions WHERE partition=? "
+                            "ORDER BY safe_offset, reader_id", (p,))],
                         "sequences": [dict(s) for s in con.execute(
                             "SELECT * FROM seq_state WHERE partition=? "
                             "ORDER BY producer_id", (p,))],
@@ -1134,6 +1302,24 @@ class Log:
                                 continue
                             s["records"] = self._raw_records(s, txn_states)
                     out["partitions"][p] = pinfo
+                for r in con.execute(
+                        "SELECT * FROM readers ORDER BY reader_id"):
+                    entry = {"start_mode": r["start_mode"],
+                             "start_offset": r["start_offset"],
+                             "partitions": {}}
+                    for pr in con.execute(
+                            "SELECT * FROM reader_positions WHERE reader_id=? "
+                            "ORDER BY partition", (r["reader_id"],)):
+                        gaps = [x["offset"] for x in con.execute(
+                            "SELECT offset FROM reader_acks WHERE reader_id=? "
+                            "AND partition=? AND offset>=? ORDER BY offset",
+                            (r["reader_id"], pr["partition"],
+                             pr["safe_offset"]))]
+                        entry["partitions"][pr["partition"]] = {
+                            "read_offset": pr["read_offset"],
+                            "safe_offset": pr["safe_offset"],
+                            "blocking_gaps": gaps}
+                    out["readers"][r["reader_id"]] = entry
                 return out
             finally:
                 con.close()
@@ -1166,9 +1352,13 @@ class Log:
             return {"error": str(e)}
 
 
-def _constraint(requested, applied, lso, floor, hw):
+def _constraint(requested, applied, lso, floor, hw, reader_floor=None):
     if applied >= requested:
         return "requested"
+    # a live reader's safe cursor pins retention; report it first when it
+    # is the binding minimum so diagnostics name the blocking reader.
+    if reader_floor is not None and applied == reader_floor and reader_floor < hw:
+        return "reader"
     if applied == lso and lso < hw:
         return "lso"
     if applied == floor and floor < hw:

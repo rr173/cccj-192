@@ -124,18 +124,94 @@ retry (idempotent) or via `txn_state(txn_id)`.
 
 `retain(partition, before_offset)` requests cleanup and returns the
 **actually applied boundary** plus evidence (`deleted_segments`,
-`constrained_by`, `lso`, `dedup_floor`, `high_watermark`).  The applied
-boundary never crosses:
+`constrained_by`, `lso`, `dedup_floor`, `reader_floor`, `reader_holds`,
+`high_watermark`).  The applied boundary never crosses:
 
 * the partition's **stable frontier** (pending transactions keep data);
 * the **dedup floor** (oldest offset still covered by a retry identity —
-  retry identity is never lost while inside its window).
+  retry identity is never lost while inside its window);
+* every **live named reader's safe cursor** on that partition (see below).
 
 Only sealed segments fully below the boundary are unlinked; the frontier
 itself is logical and exact.  Decided-transaction metadata is
 garbage-collected only once **every** partition the transaction touched
 has retained past its records — one partition cleaning ahead can never
 destroy another partition's visibility evidence.
+
+## Named, resumable application readers
+
+A bare `fetch` leaves position bookkeeping to the caller; a named
+**reader** owns durable, restart-safe read progress with explicit
+per-record acknowledgement.  Readers do **not** do consumer-group
+assignment, load balancing or background scheduling — they only make
+"what has this application safely processed" a durable fact.
+
+```python
+r = log.create_reader("etl-1")                 # tail: starts at the
+                                               # current retention boundary
+r = log.create_reader("etl-2", start=0)        # explicit readable start
+r2 = log.create_reader("etl-2", start=0)       # identical -> reused=True
+# log.create_reader("etl-2", start=9)          # ReaderConflict: a recreate
+#                                              # never silently resets progress
+
+page = r.poll(0, max_records=100)              # read_committed only
+for rec in page["records"]:                    # rec carries reader_id,
+    process(rec["payload"])                    # partition and offset
+    r.ack(0, rec["offset"])                    # idempotent per record
+r.status(0)     # safe_offset, read_offset, blocking_gaps
+r.replay(0, 5)  # re-deliver from a retained position; acks are untouched
+r.delete()      # explicit deletion; releases the reader's retain hold
+```
+
+### Cursors: delivery high-water vs. safe cursor
+
+Two distinct numbers are persisted per (reader, partition):
+
+* `read_offset` — every read_committed-visible record below it has been
+  *delivered* by some `poll` (durable; used to restart a poller);
+* `safe_offset` — the **contiguous acknowledgement cursor**.  Every
+  delivered record in `[start, safe_offset)` is acked.  Abort holes are
+  skipped but keep their offset semantics.
+
+Acks are stored as a **set of offsets**, never as "highest acked offset".
+If offsets 2 and 0 are acked while 1 is not, the safe cursor stays at 1;
+acking 1 then advances it continuously to 3 (and over any abort holes).
+Out-of-order completion of many records is therefore safe, and multiple
+readers independently track the same partition.  Acks are idempotent; the
+rejections are classified (`ReaderAckError.reason`):
+
+* `wrong_partition` — the reader never opened that partition;
+* `not_delivered` — stable/readable offset that this reader never got;
+* `beyond_stable` — past the stable readable frontier;
+* `abort_hole` — an aborted-record position, never delivered.
+
+### Restart, redelivery and replay semantics
+
+A new handle (`open_reader`, or a new process) resumes polling at the
+safe cursor: a record that was delivered but not acked before a crash is
+delivered again (at-least-once).  All progress lives in SQLite
+(synchronous=FULL); ack receipts lost after the commit simply return
+`duplicate=True` on retry.  `replay(partition, offset)` only moves the
+handle's poll position — it never erases acks and old acks can never pull
+new progress backwards.  An explicit `poll(offset=...)` is handle-local
+peeking and never marks skipped positions as delivered.
+
+If legal retention has already moved past a reader's starting position,
+the next poll raises `ReaderDataUnavailable` carrying the recoverable
+boundary (`retained_below`); it is never reported as an empty page, a
+permanent log end or an automatic jump.  Recover explicitly with
+`replay(partition, retained_below)`.
+
+### Readers and retention
+
+`retain` additionally takes the minimum of every live reader's
+`safe_offset` (`reader_floor`); a slow reader therefore keeps the
+segments it has not finished processing, and `reader_holds` /
+`constrained_by="reader"` name the blocking reader in the retain report
+and in `inspect()`.  Deleting a reader is an explicit operation that
+returns the released holds; the next `retain` then recomputes the
+cleanable range.  Segment deletion still requires the exclusive
+`retain.lock`, so an in-flight poll can never read an unlinked file.
 
 ### Durability contract
 
@@ -177,6 +253,16 @@ txlog fetch DIR --partition P [--offset O] [--max-records N]
 txlog retain DIR --partition P --before-offset N
 txlog inspect DIR [--partition P] [--raw]        # raw segments, txns, retention evidence
 txlog txn-state DIR --txn-id T
+
+Named resumable readers (read_committed only):
+txlog reader-create DIR READER [--start-offset O]
+txlog reader-open DIR READER
+txlog reader-poll DIR READER --partition P [--max-records N] [--offset O]
+txlog reader-ack DIR READER --partition P --offset O
+txlog reader-status DIR READER [--partition P]
+txlog reader-replay DIR READER --partition P [--offset O]
+txlog reader-delete DIR READER
+txlog readers DIR
 ```
 
 All commands print JSON.  `inspect --raw` dumps every segment record with
@@ -197,6 +283,7 @@ abort.before_decision   abort.after_decision
 open_producer.after_fence
 retain.after_catalog    retain.after_delete
 fetch.after_snapshot    (test-hook only)
+reader.poll.after_meta  reader.ack.after_meta
 ```
 
 ## Tests
@@ -221,5 +308,18 @@ python3 scripts/stress.py --ops 20000 --writers 3 --readers 4
   snapshot stability, retention constraints.
 * `tests/test_corruption.py` — half-record tails, mid-segment checksum
   damage, missing segments.
-* `scripts/stress.py` — concurrent workload generator with online and
-  post-recovery invariant verification.
+* `tests/test_readers.py` — named-reader acceptance: independent readers,
+  out-of-order gap blocking, abort holes, redelivery, replay, the
+  unrecoverable-boundary contract and reader-pinned retention.
+* `tests/test_reader_model_diff.py` — an independent serial reader model
+  (ack sets, contiguous cursors, redelivery, reader retain floor)
+  replaying random poll/ack/replay/retain/delete/reopen histories and
+  compared step-by-step against the real implementation.
+* `tests/test_reader_concurrency.py` — concurrent poll/ack/retain,
+  competing handles and delete/poll interleavings.
+* `tests/test_reader_recovery.py` — real `os._exit` crashes at reader
+  poll/ack commit points and mid-retain, with lost-receipt retries.
+* `scripts/stress.py` — concurrent workload generator (writers, raw
+  fetchers, named readers and a retainer) with online and post-recovery
+  invariant verification.  Data is generated at runtime and bounded by
+  the CLI flags; no generated data files are checked in.

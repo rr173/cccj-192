@@ -14,6 +14,17 @@
     txlog inspect DIR [--partition P] [--raw]
     txlog txn-state DIR --txn-id T
 
+Named resumable readers (read_committed only):
+    txlog reader-create DIR READER [--start-offset O]
+    txlog reader-open DIR READER
+    txlog reader-poll DIR READER --partition P [--max-records N]
+                                [--max-scan N] [--offset O]
+    txlog reader-ack DIR READER --partition P --offset O
+    txlog reader-status DIR READER [--partition P]
+    txlog reader-replay DIR READER --partition P [--offset O]
+    txlog reader-delete DIR READER
+    txlog readers DIR
+
 Crash injection: set TXLOG_FAULT=<point>[:<n>] in the environment to make
 the process os._exit(42) at the named fault point (see txlog/faults.py).
 """
@@ -140,6 +151,59 @@ def cmd_txn_state(args):
         return log.txn_state(args.txn_id)
 
 
+# -- named readers ----------------------------------------------------------
+
+def cmd_reader_create(args):
+    with _open(args, writable=True) as log:
+        r = log.create_reader(args.reader, start=args.start_offset)
+        return {"reader_id": r.reader_id, "reused": r.reused,
+                "start_mode": ("offset" if args.start_offset is not None
+                               else "boundary"),
+                "start_offset": args.start_offset}
+
+
+def cmd_reader_open(args):
+    with _open(args, writable=True) as log:
+        r = log.open_reader(args.reader)
+        return r.status()
+
+
+def cmd_reader_poll(args):
+    with _open(args, writable=True) as log:
+        r = log.open_reader(args.reader)
+        page = r.poll(args.partition, max_records=args.max_records,
+                      max_scan=args.max_scan, offset=args.offset)
+        return _enc_page(page)
+
+
+def cmd_reader_ack(args):
+    with _open(args, writable=True) as log:
+        r = log.open_reader(args.reader)
+        return r.ack(args.partition, args.offset)
+
+
+def cmd_reader_status(args):
+    with _open(args, writable=True) as log:
+        r = log.open_reader(args.reader)
+        return r.status(partition=args.partition)
+
+
+def cmd_reader_replay(args):
+    with _open(args, writable=True) as log:
+        r = log.open_reader(args.reader)
+        return r.replay(args.partition, offset=args.offset)
+
+
+def cmd_reader_delete(args):
+    with _open(args, writable=True) as log:
+        return log.delete_reader(args.reader)
+
+
+def cmd_readers(args):
+    with _open(args, writable=False) as log:
+        return log.list_readers()
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="txlog", description="transactional partitioned local log")
@@ -208,6 +272,65 @@ def build_parser():
     sp.add_argument("--txn-id", type=int, required=True)
     sp.set_defaults(fn=cmd_txn_state)
 
+    sp = sub.add_parser("reader-create",
+                        help="create or idempotently reuse a named reader")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.add_argument("--start-offset", type=int, default=None,
+                    help="explicit still-readable start; default = current "
+                         "retention boundary on first poll")
+    sp.set_defaults(fn=cmd_reader_create)
+
+    sp = sub.add_parser("reader-open", help="open an existing named reader")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.set_defaults(fn=cmd_reader_open)
+
+    sp = sub.add_parser("reader-poll",
+                        help="read one read_committed page as a named reader")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.add_argument("--partition", type=int, required=True)
+    sp.add_argument("--max-records", type=int, default=100)
+    sp.add_argument("--max-scan", type=int, default=None)
+    sp.add_argument("--offset", type=int, default=None,
+                    help="explicit poll position (handle-local; does not "
+                         "reset durable progress or acks)")
+    sp.set_defaults(fn=cmd_reader_poll)
+
+    sp = sub.add_parser("reader-ack",
+                        help="acknowledge one delivered record")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.add_argument("--partition", type=int, required=True)
+    sp.add_argument("--offset", type=int, required=True)
+    sp.set_defaults(fn=cmd_reader_ack)
+
+    sp = sub.add_parser("reader-status",
+                        help="safe cursor, poll high-water and blocking gaps")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.add_argument("--partition", type=int, default=None)
+    sp.set_defaults(fn=cmd_reader_status)
+
+    sp = sub.add_parser("reader-replay",
+                        help="re-open delivery at a retained position")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.add_argument("--partition", type=int, required=True)
+    sp.add_argument("--offset", type=int, default=None)
+    sp.set_defaults(fn=cmd_reader_replay)
+
+    sp = sub.add_parser("reader-delete",
+                        help="delete a reader and release its retain hold")
+    sp.add_argument("dir")
+    sp.add_argument("reader")
+    sp.set_defaults(fn=cmd_reader_delete)
+
+    sp = sub.add_parser("readers", help="list all readers and progress")
+    sp.add_argument("dir")
+    sp.set_defaults(fn=cmd_readers)
+
     return p
 
 
@@ -216,8 +339,14 @@ def main(argv=None):
     try:
         out = args.fn(args)
     except TxLogError as e:
-        print(json.dumps({"error": type(e).__name__, "message": str(e)}),
-              file=sys.stderr)
+        err = {"error": type(e).__name__, "message": str(e)}
+        # structured detail for the recoverable-boundary contract
+        for attr in ("reason", "reader_id", "partition",
+                     "requested_offset", "retained_below"):
+            val = getattr(e, attr, None)
+            if val is not None:
+                err[attr] = val
+        print(json.dumps(err), file=sys.stderr)
         return 1
     print(json.dumps(out, indent=2, sort_keys=True, default=str))
     return 0
