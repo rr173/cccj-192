@@ -26,11 +26,16 @@ Named, resumable application readers:
     r.delete()                                     # explicit; releases retain hold
 """
 
-from .errors import (ContentConflict, CorruptionError, ProducerFenced,
-                     ReaderAckError, ReaderConflict, ReaderDataUnavailable,
-                     ReaderError, SequenceGap, SequenceTooOld, TxLogError,
-                     TxnStateError, UnknownReader, UnknownTransaction)
+from .errors import (ContentConflict, CorruptionError, HistoryGapError,
+                     MaterializationBusy, MaterializationDataError,
+                     MaterializationError, ProducerFenced, ReaderAckError,
+                     ReaderConflict, ReaderDataUnavailable, ReaderError,
+                     RuleConflictError, SequenceGap, SequenceTooOld,
+                     SourceIdentityError, StaleCursorError, TxLogError,
+                     TxnStateError, UnknownReader, UnknownRelease,
+                     UnknownTransaction)
 from .log import (ISOLATION_READ_COMMITTED, ISOLATION_READ_UNCOMMITTED, Log)
+from .materialize import MaterializedStore, open_materialized
 from .producer import Producer
 from .reader import Reader
 
@@ -42,6 +47,10 @@ __all__ = [
     "UnknownTransaction",
     "ReaderError", "UnknownReader", "ReaderConflict",
     "ReaderDataUnavailable", "ReaderAckError",
+    "MaterializedStore", "open_materialized", "MaterializationError",
+    "MaterializationBusy", "SourceIdentityError", "HistoryGapError",
+    "MaterializationDataError", "RuleConflictError", "StaleCursorError",
+    "UnknownRelease",
 ]
 
 __version__ = "0.1.0"

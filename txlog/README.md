@@ -239,6 +239,104 @@ byte** (framing + CRC32 + offset contiguity):
   read-only opens (`writable=False`) skip recovery so corrupt logs stay
   inspectable via `inspect(raw=True)`.
 
+## Local incremental materialization: event assignment details
+
+A *materialized store* turns the raw committed records into a directly
+usable "event ownership" detail table.  It lives in its **own separate
+SQLite database** (e.g. `./warehouse/mat.sqlite3`), bound once to one txlog
+by the log's durable `log_id` (stored in the log's metadata DB; the
+producer/fetch/reader/retain contracts are unchanged and record bodies are
+never mirrored into the materialization DB).
+
+### Record contract
+
+Committed record bodies are UTF-8 JSON with a `kind`:
+
+* `event` — `entity` (non-empty string), integer `event_time`;
+* `assignment` — `entity`, integer `effective_from`, non-negative integer
+  `revision`, non-empty `group`.
+
+An event's business identity is its **source partition and offset**; two
+identical bodies at different coordinates are two events.  For one entity,
+the effective rule is the assignment with the greatest `effective_from`
+not later than `event_time`.  At one `(entity, effective_from)` the highest
+`revision` wins; an identical `(entity, effective_from, revision, group)`
+seen from several positions is one version whose source is the smallest
+`(partition, offset)` location.  The same `(entity, effective_from,
+revision)` carrying different groups is an unresolvable
+`RuleConflictError` — the whole refresh is rejected.  Events with no
+matching rule stay published, explicitly unassigned.
+
+### Prefix-vector publication
+
+A refresh takes one source snapshot and, per partition, uses the stable
+frontier as an exclusive upper bound.  It then chooses the maximal prefix
+vector such that every **committed transaction is either fully inside or
+fully outside** the prefix — a pending transaction on another partition can
+never make half of a cross-partition transaction visible, and cutting one
+partition may force a transaction to wait on another.  All still-safe
+prefixes are published; one blocked partition never stalls the others.
+Aborted records produce no details but keep their offset-advance semantics.
+The report carries the actual positions plus, for every partition held
+short of its frontier, the deferred partition, the waiting transaction and
+the open transaction/offset blocking it.
+
+### Releases, changes and paging
+
+Each publish is a gapless **release**.  Details, net changes, the release
+number and the source-position vector commit in one SQLite transaction; a
+refresh with no new positions creates no release and never wipes the
+previous release's changes.  Changes are keyed by event source position and
+contain either an inserted detail or the before/after assignment and rule
+source of a correction, computed from the round's **final** state (no
+intermediate or false corrections).  Detail/change pages are pinned to one
+release; continuing with a cursor from an older release raises
+`StaleCursorError` instead of silently mixing versions.
+
+Refreshes read only not-yet-materialized source bodies and re-evaluate only
+the entities whose rules changed — no full log copy or table rebuild.
+Normal retention of already-materialized ranges is harmless; if the source
+has retained away **unprocessed** offsets, or a different log sits at the
+bound path, the refresh raises (`HistoryGapError` /
+`SourceIdentityError`) while the previous result stays readable.
+
+```python
+import txlog
+
+store = txlog.open_materialized("./warehouse/mat.sqlite3", "./log")
+report = store.refresh()
+report["release_no"]          # None until the first publishable prefix
+report["positions"]           # {partition: exclusive offset}
+report["deferred"]            # held-back partitions with txn/offset reasons
+
+store.status()                # binding, latest release, vector, counts
+page = store.read_details(limit=100)                 # current release
+page = store.read_details(limit=100, cursor=page["next_cursor"])
+store.read_changes()          # latest release's net changes
+store.read_changes(3)         # any historical release's changes
+```
+
+### Materialization CLI
+
+```
+txlog mat-open MAT-DB SOURCE-DIR           # bind a new store to a log
+txlog mat-refresh MAT-DB [SOURCE-DIR]      # one incremental refresh
+txlog mat-status MAT-DB                    # publish state
+txlog mat-details MAT-DB [--limit N] [--cursor C]
+txlog mat-changes MAT-DB [--release R] [--limit N] [--cursor C]
+```
+
+### Materialization fault points
+
+```
+materialize.before_commit   release fully computed, not yet committed
+materialize.after_commit    release committed, receipt being returned
+```
+
+An exit before the commit leaves no release and the retry rebuilds the
+round; an exit after the commit durably published, so the retry republishes
+nothing and never re-sends that batch's changes under a new number.
+
 ## CLI
 
 ```
@@ -253,7 +351,6 @@ txlog fetch DIR --partition P [--offset O] [--max-records N]
 txlog retain DIR --partition P --before-offset N
 txlog inspect DIR [--partition P] [--raw]        # raw segments, txns, retention evidence
 txlog txn-state DIR --txn-id T
-
 Named resumable readers (read_committed only):
 txlog reader-create DIR READER [--start-offset O]
 txlog reader-open DIR READER
@@ -263,6 +360,13 @@ txlog reader-status DIR READER [--partition P]
 txlog reader-replay DIR READER --partition P [--offset O]
 txlog reader-delete DIR READER
 txlog readers DIR
+
+Local incremental materialization (separate SQLite store):
+txlog mat-open MAT-DB SOURCE-DIR
+txlog mat-refresh MAT-DB [SOURCE-DIR]
+txlog mat-status MAT-DB
+txlog mat-details MAT-DB [--limit N] [--cursor C]
+txlog mat-changes MAT-DB [--release R] [--limit N] [--cursor C]
 ```
 
 All commands print JSON.  `inspect --raw` dumps every segment record with
@@ -284,6 +388,7 @@ open_producer.after_fence
 retain.after_catalog    retain.after_delete
 fetch.after_snapshot    (test-hook only)
 reader.poll.after_meta  reader.ack.after_meta
+materialize.before_commit  materialize.after_commit
 ```
 
 ## Tests
@@ -293,6 +398,8 @@ cd txlog
 python3 -m unittest discover -s tests -t . -v
 python3 scripts/stress.py --small            # tiny fixture, seconds
 python3 scripts/stress.py --ops 20000 --writers 3 --readers 4
+python3 scripts/mat_stress.py --small        # materialization stress
+python3 scripts/mat_stress.py --rounds 200
 ```
 
 * `tests/test_acceptance.py` — starts from a **handwritten** log (segment
@@ -319,6 +426,36 @@ python3 scripts/stress.py --ops 20000 --writers 3 --readers 4
   competing handles and delete/poll interleavings.
 * `tests/test_reader_recovery.py` — real `os._exit` crashes at reader
   poll/ack commit points and mid-retain, with lost-receipt retries.
+
+Local incremental materialization:
+
+* `tests/test_mat_handhistory.py` — the **handwritten** two-position
+  history from the spec: first refresh `(2,2,0)` upper publishes only
+  `(1,0,0)` (just unassigned E20); aborting the pending transaction reaches
+  `(2,2,2)` with gold E20 / unassigned E9 / blue E12; plus late-rule
+  correction scoping, high/low revision, the `effective_from == event_time`
+  boundary, version conflicts and smallest-location duplicates.
+* `tests/test_mat_model_diff.py` — an **independent brute-force model**
+  enumerates every transaction-atomic prefix vector, takes the component-wise
+  maximum and re-evaluates each selected event from scratch; random
+  interleaved histories (cross-partition commit/abort/open txns, late rules,
+  no-op refreshes and reopens) are compared release-by-release including the
+  exact net-change set.  Trial count/seed via `TXLOG_MAT_TRIALS`/
+  `TXLOG_MAT_SEED`.
+* `tests/test_mat_reads.py` — release-pinned paging and `StaleCursorError`,
+  source `log_id` identity refusal, retained-away history gaps, and atomic
+  rejection of invalid UTF-8 / JSON / schema records with coordinates.
+* `tests/test_mat_concurrency.py` — concurrent refreshes serialize into
+  gapless unique releases, reads stay coherent during refreshes, and a
+  second store loses the cross-process refresh flock.
+* `tests/test_mat_recovery.py` — real `os._exit` at
+  `materialize.before_commit` (no release, clean retry) and
+  `materialize.after_commit` (release durable, lost receipt never
+  republished), plus cross-process incremental continuation.
+* `tests/test_mat_cli.py` / `tests/test_mat_large.py` — the `mat-*` CLI
+  surface with structured errors, and runtime-generated large histories
+  checking incremental scaling, change scoping and retention of processed
+  segments.
 * `scripts/stress.py` — concurrent workload generator (writers, raw
   fetchers, named readers and a retainer) with online and post-recovery
   invariant verification.  Data is generated at runtime and bounded by

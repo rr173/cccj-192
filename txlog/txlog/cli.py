@@ -37,6 +37,7 @@ import sys
 
 from .errors import TxLogError
 from .log import Log
+from .materialize import open_materialized
 
 
 def _lock_timeout():
@@ -204,6 +205,49 @@ def cmd_readers(args):
         return log.list_readers()
 
 
+# -- local incremental materialization --------------------------------------
+
+def cmd_mat_open(args):
+    store = open_materialized(args.mat, args.source)
+    try:
+        return store.status()
+    finally:
+        store.close()
+
+
+def cmd_mat_refresh(args):
+    store = open_materialized(args.mat, create=False)
+    try:
+        return store.refresh(source_path=args.source)
+    finally:
+        store.close()
+
+
+def cmd_mat_status(args):
+    store = open_materialized(args.mat, create=False)
+    try:
+        return store.status()
+    finally:
+        store.close()
+
+
+def cmd_mat_details(args):
+    store = open_materialized(args.mat, create=False)
+    try:
+        return store.read_details(limit=args.limit, cursor=args.cursor)
+    finally:
+        store.close()
+
+
+def cmd_mat_changes(args):
+    store = open_materialized(args.mat, create=False)
+    try:
+        return store.read_changes(args.release, limit=args.limit,
+                                  cursor=args.cursor)
+    finally:
+        store.close()
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="txlog", description="transactional partitioned local log")
@@ -331,6 +375,37 @@ def build_parser():
     sp.add_argument("dir")
     sp.set_defaults(fn=cmd_readers)
 
+    # local incremental materialization
+    mat = sub.add_parser("mat-open",
+                         help="create/open a materialized store bound to a log")
+    mat.add_argument("mat", help="SQLite file of the materialized store")
+    mat.add_argument("source", help="bound txlog directory")
+    mat.set_defaults(fn=cmd_mat_open)
+
+    mat = sub.add_parser("mat-refresh", help="run one incremental refresh")
+    mat.add_argument("mat")
+    mat.add_argument("source", nargs="?", default=None,
+                     help="optional source directory override (identity is "
+                          "still verified against the bound log_id)")
+    mat.set_defaults(fn=cmd_mat_refresh)
+
+    mat = sub.add_parser("mat-status", help="show publish state")
+    mat.add_argument("mat")
+    mat.set_defaults(fn=cmd_mat_status)
+
+    mat = sub.add_parser("mat-details", help="page the current details")
+    mat.add_argument("mat")
+    mat.add_argument("--limit", type=int, default=100)
+    mat.add_argument("--cursor", default=None)
+    mat.set_defaults(fn=cmd_mat_details)
+
+    mat = sub.add_parser("mat-changes", help="read one release's net changes")
+    mat.add_argument("mat")
+    mat.add_argument("--release", type=int, default=None)
+    mat.add_argument("--limit", type=int, default=100)
+    mat.add_argument("--cursor", default=None)
+    mat.set_defaults(fn=cmd_mat_changes)
+
     return p
 
 
@@ -340,9 +415,14 @@ def main(argv=None):
         out = args.fn(args)
     except TxLogError as e:
         err = {"error": type(e).__name__, "message": str(e)}
-        # structured detail for the recoverable-boundary contract
+        # structured detail for the recoverable-boundary / materialization
+        # contracts
         for attr in ("reason", "reader_id", "partition",
-                     "requested_offset", "retained_below"):
+                     "requested_offset", "retained_below",
+                     "offset", "release_no", "cursor_release",
+                     "current_release", "entity", "effective_from",
+                     "revision", "locations", "missing_from", "missing_to",
+                     "expected_log_id", "actual_log_id"):
             val = getattr(e, attr, None)
             if val is not None:
                 err[attr] = val

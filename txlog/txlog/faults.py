@@ -18,6 +18,10 @@ Every durable operation in txlog passes through named fault points, e.g.:
     reader.poll.after_meta  poll progress committed, receipt being returned
     reader.ack.after_meta   ack + safe cursor committed, receipt being
                             returned (a lost receipt must retry idempotently)
+    materialize.before_commit  materialized release fully computed but the
+                            SQLite publish transaction not yet committed
+    materialize.after_commit   release committed, before the receipt returns
+                            (a lost receipt must not republish the same batch)
 
 Configuration:
   * Environment variable TXLOG_FAULT="<point>" or "<point>:<n>" — when the

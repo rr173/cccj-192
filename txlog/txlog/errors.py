@@ -92,3 +92,89 @@ class ReaderAckError(ReaderError):
     def __init__(self, reason, message):
         super().__init__(message)
         self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# local incremental materialization (event assignment details)
+# ---------------------------------------------------------------------------
+
+class MaterializationError(TxLogError):
+    """Base class for materialized-store errors."""
+
+
+class MaterializationBusy(MaterializationError):
+    """Another process/thread holds the materialized store's refresh lock.
+
+    A refresh is a single critical section; two refreshes can never build on
+    the same old release and overwrite each other.
+    """
+
+
+class SourceIdentityError(MaterializationError):
+    """The opened source log is not the one the materialized store was bound
+    to (its persistent ``log_id`` differs), even if the path looks the same.
+    The previous materialized result stays readable and untouched."""
+
+    def __init__(self, message, *, expected_log_id=None, actual_log_id=None,
+                 expected_path=None, actual_path=None):
+        super().__init__(message)
+        self.expected_log_id = expected_log_id
+        self.actual_log_id = actual_log_id
+        self.expected_path = expected_path
+        self.actual_path = actual_path
+
+
+class HistoryGapError(MaterializationError):
+    """The source has already retained away offsets the materialized store
+    has not processed yet.  The refresh is refused (the previous result stays
+    readable); the missing source coordinate range is carried on the error.
+    """
+
+    def __init__(self, message, *, partition, missing_from, missing_to):
+        super().__init__(message)
+        self.partition = partition
+        self.missing_from = missing_from
+        self.missing_to = missing_to
+
+
+class MaterializationDataError(MaterializationError):
+    """A record body selected for a publishable prefix is not a valid
+    UTF-8 JSON event/assignment document.  The whole refresh fails atomically
+    and the offending source coordinate (partition, offset) is carried on the
+    error.  Nothing is half-published."""
+
+    def __init__(self, message, *, partition, offset, reason):
+        super().__init__(message)
+        self.partition = partition
+        self.offset = offset
+        self.reason = reason
+
+
+class RuleConflictError(MaterializationError):
+    """Two assignment versions with the same (entity, effective_from,
+    revision) carry different groups.  Such a version can never be resolved
+    deterministically, so the refresh is rejected with both source locations.
+    """
+
+    def __init__(self, message, *, entity, effective_from, revision, locations):
+        super().__init__(message)
+        self.entity = entity
+        self.effective_from = effective_from
+        self.revision = revision
+        # list of {"partition", "offset", "group"}
+        self.locations = locations
+
+
+class StaleCursorError(MaterializationError):
+    """A pagination cursor belongs to an older release.  Paging is pinned to
+    one release; an expired cursor is rejected explicitly instead of silently
+    concatenating rows from two releases."""
+
+    def __init__(self, message, *, cursor_release, current_release):
+        super().__init__(message)
+        self.cursor_release = cursor_release
+        self.current_release = current_release
+
+
+class UnknownRelease(MaterializationError):
+    """The requested release number does not exist in this store."""

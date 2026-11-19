@@ -30,6 +30,7 @@ import fcntl
 import os
 import threading
 import time
+import uuid
 import zlib
 from contextlib import contextmanager
 
@@ -265,8 +266,14 @@ class Log:
                 self.segment_bytes = segment_bytes or DEFAULT_SEGMENT_BYTES
                 self.dedup_window = (dedup_window if dedup_window is not None
                                      else DEFAULT_DEDUP_WINDOW)
+                # The log's durable identity.  Materialized stores bind to
+                # this value, so a different log placed at the same path can
+                # never be mistaken for the original source.
+                self.log_id = uuid.uuid4().hex
                 con.execute("INSERT INTO meta VALUES ('format', ?)",
                             (FORMAT_VERSION,))
+                con.execute("INSERT INTO meta VALUES ('log_id', ?)",
+                            (self.log_id,))
                 con.execute("INSERT INTO meta VALUES ('segment_bytes', ?)",
                             (str(self.segment_bytes),))
                 con.execute("INSERT INTO meta VALUES ('dedup_window', ?)",
@@ -278,6 +285,22 @@ class Log:
                     "SELECT value FROM meta WHERE key='segment_bytes'").fetchone()["value"])
                 self.dedup_window = int(con.execute(
                     "SELECT value FROM meta WHERE key='dedup_window'").fetchone()["value"])
+                id_row = con.execute(
+                    "SELECT value FROM meta WHERE key='log_id'").fetchone()
+                if id_row is None:
+                    # Backfill for logs created before log_id existed.  Only a
+                    # writable open may mint durable metadata; a read-only
+                    # handle reports the missing identity explicitly instead.
+                    if not self.writable:
+                        self.log_id = None
+                    else:
+                        self.log_id = uuid.uuid4().hex
+                        with self._txn(con):
+                            con.execute(
+                                "INSERT INTO meta VALUES ('log_id', ?)",
+                                (self.log_id,))
+                else:
+                    self.log_id = id_row["value"]
         finally:
             con.close()
 
