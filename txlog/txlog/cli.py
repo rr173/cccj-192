@@ -34,7 +34,9 @@ import base64
 import json
 import os
 import sys
+import time
 
+from .backup import open_repository
 from .errors import TxLogError
 from .log import Log
 from .materialize import open_materialized
@@ -248,6 +250,56 @@ def cmd_mat_changes(args):
         store.close()
 
 
+# -- online backup / offline restore ----------------------------------------
+
+def cmd_backup_init(args):
+    repo = open_repository(args.repo, create=True)
+    return {"repository": repo.path, "format": "1"}
+
+
+def cmd_backup_create(args):
+    # The source is opened read-only: a backup never takes the writer lock,
+    # never advances a cursor, changes transaction state or raises the
+    # retention frontier.
+    log = Log(args.dir, writable=False, create=False,
+              lock_timeout=_lock_timeout())
+    repo = open_repository(args.repo, create=True)
+
+    def pause(_view):
+        if args.pause_after_capture > 0:
+            time.sleep(args.pause_after_capture)
+
+    try:
+        return repo.create_backup(log, args.name, after_capture=pause)
+    finally:
+        log.close()
+
+
+def cmd_backup_list(args):
+    repo = open_repository(args.repo, create=False)
+    return {"repository": repo.path, "points": repo.list_points()}
+
+
+def cmd_backup_verify(args):
+    repo = open_repository(args.repo, create=False)
+    return repo.verify_point(args.name, deep=not args.shallow)
+
+
+def cmd_backup_restore(args):
+    repo = open_repository(args.repo, create=False)
+    return repo.restore_point(args.name, args.target)
+
+
+def cmd_backup_delete(args):
+    repo = open_repository(args.repo, create=False)
+    return repo.delete_point(args.name)
+
+
+def cmd_backup_gc(args):
+    repo = open_repository(args.repo, create=False)
+    return repo.gc()
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="txlog", description="transactional partitioned local log")
@@ -406,6 +458,53 @@ def build_parser():
     mat.add_argument("--cursor", default=None)
     mat.set_defaults(fn=cmd_mat_changes)
 
+    # online backup repository / offline restore
+    bkp = sub.add_parser("backup-init",
+                         help="initialize a backup repository directory")
+    bkp.add_argument("repo")
+    bkp.set_defaults(fn=cmd_backup_init)
+
+    bkp = sub.add_parser("backup-create",
+                         help="capture an online recovery point")
+    bkp.add_argument("repo")
+    bkp.add_argument("dir", help="source log directory")
+    bkp.add_argument("name", help="recovery point name (immutable)")
+    bkp.add_argument("--pause-after-capture", type=float, default=0.0,
+                     help="sleep seconds after the source view is captured "
+                          "and preserved, while the source keeps running")
+    bkp.set_defaults(fn=cmd_backup_create)
+
+    bkp = sub.add_parser("backup-list", help="list published recovery points")
+    bkp.add_argument("repo")
+    bkp.set_defaults(fn=cmd_backup_list)
+
+    bkp = sub.add_parser("backup-verify",
+                         help="offline-verify a recovery point's blocks")
+    bkp.add_argument("repo")
+    bkp.add_argument("name")
+    bkp.add_argument("--shallow", action="store_true",
+                     help="check manifests and block hashes only; skip frame "
+                          "re-parsing")
+    bkp.set_defaults(fn=cmd_backup_verify)
+
+    bkp = sub.add_parser("backup-restore",
+                         help="restore a point into a non-existing directory")
+    bkp.add_argument("repo")
+    bkp.add_argument("name")
+    bkp.add_argument("target")
+    bkp.set_defaults(fn=cmd_backup_restore)
+
+    bkp = sub.add_parser("backup-delete",
+                         help="delete a point and release its exclusive blocks")
+    bkp.add_argument("repo")
+    bkp.add_argument("name")
+    bkp.set_defaults(fn=cmd_backup_delete)
+
+    bkp = sub.add_parser("backup-gc",
+                         help="reclaim unreferenced blocks and stale jobs")
+    bkp.add_argument("repo")
+    bkp.set_defaults(fn=cmd_backup_gc)
+
     return p
 
 
@@ -422,7 +521,7 @@ def main(argv=None):
                      "offset", "release_no", "cursor_release",
                      "current_release", "entity", "effective_from",
                      "revision", "locations", "missing_from", "missing_to",
-                     "expected_log_id", "actual_log_id"):
+                     "expected_log_id", "actual_log_id", "problems"):
             val = getattr(e, attr, None)
             if val is not None:
                 err[attr] = val

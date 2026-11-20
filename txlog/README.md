@@ -337,6 +337,125 @@ An exit before the commit leaves no release and the retry rebuilds the
 round; an exit after the commit durably published, so the retry republishes
 nothing and never re-sends that batch's changes under a new number.
 
+### Backup / restore fault points
+
+```
+backup.after_capture    source view captured and preserved, before block
+                        archiving (no point exists yet)
+backup.before_publish   every block archived, manifest not yet published
+backup.after_publish    manifest durable, before the receipt is returned
+restore.before_rename   the restored log is fully staged and recovered,
+                        before the final staging -> target rename
+```
+
+Exits at the first two points leave no visible recovery point (a later
+`backup-gc` reclaims the job and its unreferenced blocks); an exit after
+publish leaves a fully valid point; an exit during restore leaves only a
+removable `<target>.restoring-*` staging directory, never a finished log.
+
+## Online backup repository and offline restore
+
+A *backup repository* is a self-contained local directory (no remote
+service) holding named, immutable **recovery points** plus a
+content-addressed, bounded-size block store.  It is independent of the
+live log and of any materialized database, so the whole directory can be
+moved to another disk.
+
+### Guarantees
+
+* **Online capture, no blocking of the source.** The metadata snapshot is
+  taken in one read-only SQLite transaction while a *shared* retain flock
+  is held; every segment the view needs is preserved immediately with a
+  hard link (a bounded shared-lock copy on cross-device setups).  Locks
+  are released before body hashing/copying, so the source keeps accepting
+  appends, segment rolls, transaction decisions, reader acks and
+  retention — eligible old segments are really unlinked from the source
+  while the backup still owns its own copy.  A backup never advances a
+  cursor, changes transaction state or raises the retention frontier.
+* **One explainable source view per point.** The manifest records the
+  partitions, the segment list with the byte range each segment
+  contributes to the view, producer epochs and retry windows, transaction
+  states and their positions, and every named reader's safe cursor and
+  out-of-order acks — all corresponding to the same snapshot.  Only raw
+  segment bytes are archived (frames are validated, never interpreted);
+  `read_committed` output is never written back.  Pending transactions
+  stay pending, abort holes keep their positions, records appended after a
+  pending transaction are preserved, and already-retained positions are
+  never resurrected.
+* **Confirmed bytes only.** If the active segment has a durable tail that
+  did not enter the captured view, later appends/commits/acks/partitions
+  can never reach the point.  Missing confirmed bytes, frame damage or
+  catalog/directory mismatch are reported with the partition, segment and
+  byte range, and the point is not published.
+* **Block-level sharing.** Points of the same source share identical
+  segment blocks; a grown active segment only versions its still-filling
+  last block.  The create report lists newly written and reused body
+  bytes (real shared bytes, never a compression ratio), and delete reports
+  the blocks it actually released.  Nothing reads an entire log or large
+  segment into memory.
+* **Crash-safe publication/restore.** An interrupted publish leaves no
+  visible point (only a reclaimable job directory); existing points stay
+  valid.  Restore stages into `<target>.restoring-*`, runs the ordinary
+  catalog/byte recovery, and only then renames into the non-existing
+  target; a failed or killed restore never leaves a look-alike finished
+  log and concurrent restores into one target have at most one winner.
+* **New identity on restore.** The restored log keeps the captured
+  offsets, transactions, reader progress and producer history, but mints a
+  NEW durable `log_id` (the original identity and point name are
+  reported), so the restored branch is never mistaken for the source a
+  materialized store was bound to.  Reopen producers/readers normally.
+
+### Python API
+
+```python
+from txlog.backup import open_repository
+
+repo = open_repository("./backups")            # initialize/open the repo
+point = repo.create_backup(log, "2026-11-20")  # online; log keeps running
+#   point["partitions"][p]["retained_below"/"next_offset"/"segments"]
+#   point["stats"] -> bytes_new / bytes_reused / blocks_new / blocks_reused
+repo.list_points()        # source identity + per-partition frontiers of each view
+repo.verify_point("2026-11-20")               # offline hash + frame validation
+repo.restore_point("2026-11-20", "./new-log") # target must not exist
+repo.delete_point("2026-11-20")               # releases exclusive blocks
+repo.gc()                    # reclaim unreferenced blocks / crashed jobs
+```
+
+Reusing a published name raises `BackupPointExists`; verification reports
+`missing` / `corrupt` / `unsupported` findings with the affected point,
+partition, segment and byte range (`BackupVerificationError.problems`).
+
+### Repository layout
+
+```
+<repo>/
+  repo.json                 # repository id + backup format version
+  repo.lock                 # shared (verify/restore) / exclusive (publish/delete) flock
+  points/<name>.json        # immutable, atomically published manifests
+  chunks/<shard>/<sha256>   # content-addressed segment blocks (bounded size)
+  meta/<shard>/<sha256>     # content-addressed metadata-snapshot databases
+  jobs/<id>/                # one in-progress publish (removed on completion)
+  locks/<token>.json        # live verify/restore leases (flock-backed)
+```
+
+### CLI
+
+```
+txlog backup-init REPO
+txlog backup-create REPO LOG-DIR NAME [--pause-after-capture SECONDS]
+txlog backup-list REPO
+txlog backup-verify REPO NAME [--shallow]
+txlog backup-restore REPO NAME TARGET-DIR
+txlog backup-delete REPO NAME
+txlog backup-gc REPO
+```
+
+An end-to-end operator walk-through (multi-partition log, recyclable old
+segments, gap reader, pending cross-partition transaction, paused capture
+with concurrent commit/ack/append/retain, off-line restores of both
+points, block reclaim) is in `scripts/backup_demo.py`; all data is
+generated at runtime.
+
 ## CLI
 
 ```
@@ -367,6 +486,15 @@ txlog mat-refresh MAT-DB [SOURCE-DIR]
 txlog mat-status MAT-DB
 txlog mat-details MAT-DB [--limit N] [--cursor C]
 txlog mat-changes MAT-DB [--release R] [--limit N] [--cursor C]
+
+Online backup repository / offline restore:
+txlog backup-init REPO
+txlog backup-create REPO LOG-DIR NAME [--pause-after-capture SECONDS]
+txlog backup-list REPO
+txlog backup-verify REPO NAME [--shallow]
+txlog backup-restore REPO NAME TARGET-DIR
+txlog backup-delete REPO NAME
+txlog backup-gc REPO
 ```
 
 All commands print JSON.  `inspect --raw` dumps every segment record with
@@ -389,6 +517,8 @@ retain.after_catalog    retain.after_delete
 fetch.after_snapshot    (test-hook only)
 reader.poll.after_meta  reader.ack.after_meta
 materialize.before_commit  materialize.after_commit
+backup.after_capture  backup.before_publish  backup.after_publish
+restore.before_rename  verify.entered (test-hook only)
 ```
 
 ## Tests
@@ -400,6 +530,7 @@ python3 scripts/stress.py --small            # tiny fixture, seconds
 python3 scripts/stress.py --ops 20000 --writers 3 --readers 4
 python3 scripts/mat_stress.py --small        # materialization stress
 python3 scripts/mat_stress.py --rounds 200
+python3 scripts/backup_demo.py               # full backup/restore walk-through
 ```
 
 * `tests/test_acceptance.py` — starts from a **handwritten** log (segment
@@ -456,6 +587,30 @@ Local incremental materialization:
   surface with structured errors, and runtime-generated large histories
   checking incremental scaling, change scoping and retention of processed
   segments.
+
+Online backup / offline restore:
+
+* `tests/test_backup_acceptance.py` — the operator scenario end to end:
+  recyclable old segments, a reader gap and a pending cross-partition
+  transaction; the first point is paused while the source commits, fills
+  the gap, appends, rolls and really deletes old segments; both points are
+  restored after the source directory is moved away and checked against
+  predictions; the old point is deleted and its exclusive blocks reclaimed
+  while the surviving point still verifies and restores.
+* `tests/test_backup_core.py` — immutable naming, block sharing and grown
+  last-block versioning, bounded chunking, missing/corrupt/unsupported
+  reporting with partition/segment/byte range, confirmed-bytes-only tail
+  handling, cross-device fallback, and failed publications leaving no point.
+* `tests/test_backup_crash.py` — real `os._exit` at every backup/restore
+  fault point: unpublished points never appear, crashed jobs are reclaimed,
+  published points stay durable, and a killed restore leaves no finished
+  target and retries exactly once.
+* `tests/test_backup_concurrency.py` — delete vs verify/restore leases
+  (busy instead of removing referenced bytes), one-winner concurrent
+  restores, non-blocking capture under concurrent source writes/acks/
+  retention, and gc skipping an in-progress publish.
+* `tests/test_backup_cli.py` — the `backup-*` CLI surface, including a
+  backup paused while another process writes the live log.
 * `scripts/stress.py` — concurrent workload generator (writers, raw
   fetchers, named readers and a retainer) with online and post-recovery
   invariant verification.  Data is generated at runtime and bounded by

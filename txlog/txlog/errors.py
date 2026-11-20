@@ -178,3 +178,57 @@ class StaleCursorError(MaterializationError):
 
 class UnknownRelease(MaterializationError):
     """The requested release number does not exist in this store."""
+
+
+# ---------------------------------------------------------------------------
+# online backup repository / offline restore
+# ---------------------------------------------------------------------------
+
+class BackupError(TxLogError):
+    """Base class for backup-repository and restore errors."""
+
+
+class BackupPointExists(BackupError):
+    """A published recovery point with that name already exists.
+
+    Publication is immutable: the name is never overwritten; the caller must
+    choose a different name or delete the old point explicitly.
+    """
+
+
+class BackupPointNotFound(BackupError):
+    """The named recovery point is not published in this repository."""
+
+
+class BackupBusy(BackupError):
+    """A conflicting repository operation is in progress.
+
+    Deletes need the exclusive repository lock while verification and
+    restore hold shared locks; instead of removing bytes that a running
+    verify/restore may need, the operation reports the holder as busy.
+    """
+
+
+class BackupUnsupportedVersion(BackupError):
+    """A manifest or metadata snapshot uses a backup format this code does
+    not understand.  The affected recovery point and object are named."""
+
+
+class BackupVerificationError(BackupError):
+    """A recovery point failed offline verification.
+
+    ``problems`` is a list of structured findings, each classifying the
+    failure as ``missing`` (a required chunk/object is absent), ``corrupt``
+    (checksum/frame/catalog mismatch) or ``unsupported`` (unknown format),
+    with the affected recovery point, partition/segment or byte range.
+    """
+
+    def __init__(self, message, problems):
+        super().__init__(message)
+        self.problems = problems
+
+
+class BackupTargetExists(BackupError):
+    """Restore refuses to write into a path that already exists; a finished
+    log is never overwritten and a failed restore never leaves a look-alike
+    finished directory behind."""
